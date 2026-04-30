@@ -1,0 +1,551 @@
+/***************************************************************************
+ * Copyright (C) 2025 Intelligent System Architecture (ISA) Lab. All rights reserved. 
+ * 
+ * This file is written solely for academic use in AI Accelerator Design course assignement 
+ * In School of Electrical and Electronics Engineering, Konkuk University 
+ *
+ * Unauthorized distribution is strictly prohibited.
+ ***************************************************************************/
+ 
+/////////////////////////////////////////////////
+/* YOU NEED TO COMPLETE THIS TESTBENCH AS WELL */
+/////////////////////////////////////////////////
+ 
+`timescale 1ns/1ns
+
+module tb_top ();
+
+    integer             i, j;
+    reg                 clk, rst, run, batch_mode;
+    wire        [1:0]   state;        
+ 
+    // Extended matrices for 8x16 support - stores intermediate results during computation
+    reg    signed [15:0]   X1 [0:7][0:15];              // FC1 output matrix (16-bit signed)
+    reg    signed [7:0]    X2_normalized [0:7][0:15];   // normalized data after shift operation
+    reg    signed [7:0]    X3_relu [0:7][0:15];         // ReLU processed data (negative values set to 0)
+    reg    signed [15:0]   Y_final [0:7][0:15];         // final computation result
+    reg    signed [15:0]   Y_expected [0:7][0:15];      // reference data for verification
+    
+    // Memory interface signals for weight, input, and output data
+    wire          en_w1, en_w2, en_x, en_y, en_y_final;
+    wire          we_x, we_y;
+    wire  [6:0]   addr_w1, addr_w2, addr_x, addr_y, addr_y_final; 
+ 
+    wire  [7:0]   dout_w1, dout_w2;     // weight data outputs (8-bit)
+    wire  [15:0]  dout_x;               // input data output (16-bit)
+    wire  [15:0]  din_y;                // result data input for storage
+    wire  [15:0]  dout_y, dout_y_final; // result data outputs
+    reg   [15:0]  din_x;                // input data for writing to memory
+    
+    // External control signals for memory access during testbench operations
+    reg           we_x_from_ext, re_y_from_ext, re_y_final_from_ext;
+    reg   [6:0]   addr_x_from_ext, addr_y_from_ext, addr_y_final_from_ext;
+    
+    // Top module control signals for systolic array operations
+    wire          re_w_from_top, re_x_from_top, we_y_from_top;
+    wire  [6:0]   addr_w1_from_top, addr_x_from_top, addr_y_from_top;
+    
+    reg           fc2_mode;  // switches between FC1 and FC2 weight matrices
+    
+    // Normalization module interface
+    reg           norm_en;
+    reg   [15:0]  norm_din;
+    wire  [7:0]   norm_dout;
+    wire          norm_valid;
+    
+    // ReLU activation module interface
+    reg           relu_en;
+    reg   [7:0]   relu_din;
+    wire  [7:0]   relu_dout;
+    wire          relu_valid;
+    
+    integer       current_batch_size;   // tracks current matrix dimensions (8 or 16)
+    
+    // Memory control logic - switches between FC1 and FC2 weight access
+    assign en_w1 = (!fc2_mode && re_w_from_top) ? 1'b1 : 1'b0;
+    assign addr_w1 = (!fc2_mode && re_w_from_top) ? addr_w1_from_top : 0;
+    
+    assign en_w2 = (fc2_mode && re_w_from_top) ? 1'b1 : 1'b0;
+    assign addr_w2 = (fc2_mode && re_w_from_top) ? addr_w1_from_top : 0;
+    
+    // Input memory control - external testbench vs internal systolic array access
+    assign en_x = we_x_from_ext ? 1'b1 : re_x_from_top ? 1'b1 : 1'b0;
+    assign we_x = we_x_from_ext ? 1'b1 : 1'b0;
+    assign addr_x = we_x_from_ext ? addr_x_from_ext : re_x_from_top ? addr_x_from_top : 0;
+    
+    // Output memory control - systolic array write vs external testbench read
+    assign en_y = we_y_from_top ? 1'b1 : re_y_from_ext ? 1'b1 : 1'b0;
+    assign we_y = we_y_from_top ? 1'b1 : 1'b0;
+    assign addr_y = we_y_from_top ? addr_y_from_top : re_y_from_ext ? addr_y_from_ext : 0;
+    
+    // Reference result memory control for verification
+    assign en_y_final = re_y_final_from_ext ? 1'b1 : 1'b0;
+    assign addr_y_final = re_y_final_from_ext ? addr_y_final_from_ext : 0;
+
+    // Memory instances for different batch sizes and data types
+    wire [15:0] dout_x_base, dout_x_extra;
+    wire [15:0] dout_y_final_base, dout_y_final_extra;
+    
+    // Weight memories (read-only) - contain pre-trained model parameters
+    mem_behavior  #("C:\\Users\\blsjun\\project\\data\\model\\w1_hex.txt", 8, 6, 0)
+              U_mem_W1    (   .clk(clk), .en(en_w1), .we(1'b0), .addr(addr_w1[5:0]), .din(8'b0), .dout(dout_w1) );
+    mem_behavior  #("C:\\Users\\blsjun\\project\\data\\model\\w2_hex.txt", 8, 6, 0)
+              U_mem_W2    (   .clk(clk), .en(en_w2), .we(1'b0), .addr(addr_w2[5:0]), .din(8'b0), .dout(dout_w2) );
+
+    // Input memories - separate instances for base (8x8) and extended (8x16) testing
+    mem_behavior  #("C:\\Users\\blsjun\\project\\data\\inout_base\\x_hex.txt", 16, 6, 0)
+              U_mem_X_base (   .clk(clk), .en(en_x && !batch_mode), .we(we_x && !batch_mode), .addr(addr_x[5:0]), .din(din_x), .dout(dout_x_base) );
+    
+    mem_behavior  #("C:\\Users\\blsjun\\project\\data\\inout_extra\\x_hex.txt", 16, 7, 0)
+              U_mem_X_extra (   .clk(clk), .en(en_x && batch_mode), .we(we_x && batch_mode), .addr(addr_x), .din(din_x), .dout(dout_x_extra) );
+              
+    // Output memory - stores computation results during execution
+    mem_behavior  #("", 16, 7, 0)
+              U_mem_Y     (   .clk(clk), .en(en_y), .we(we_y), .addr(addr_y), .din(din_y), .dout(dout_y) );
+              
+    // Expected result memories (read-only) - golden reference for verification
+    mem_behavior  #("C:\\Users\\blsjun\\project\\data\\inout_base\\y_hex.txt", 16, 6, 0)
+              U_mem_Y_final_base (   .clk(clk), .en(en_y_final && !batch_mode), .we(1'b0), .addr(addr_y_final[5:0]), .din(16'b0), .dout(dout_y_final_base) );
+    mem_behavior  #("C:\\Users\\blsjun\\project\\data\\inout_extra\\y_hex.txt", 16, 7, 0)
+              U_mem_Y_final_extra (   .clk(clk), .en(en_y_final && batch_mode), .we(1'b0), .addr(addr_y_final), .din(16'b0), .dout(dout_y_final_extra) );
+    
+    // Multiplex memory outputs based on current batch mode
+    assign dout_x = batch_mode ? dout_x_extra : dout_x_base;
+    assign dout_y_final = batch_mode ? dout_y_final_extra : dout_y_final_base;
+              
+    // System clock generation - 100MHz (10ns period)
+    always #5
+       clk <= ~clk;
+    
+    // Top module instance - contains the systolic array and control logic
+    top       U_top       (   .clk(clk), .rst(rst), .run(run), .batch_mode(batch_mode), .state(state),
+                              .re_A(re_w_from_top), .addr_A(addr_w1_from_top), .data_A(fc2_mode ? dout_w2 : dout_w1), 
+                              .re_B(re_x_from_top), .addr_B(addr_x_from_top), .data_B(dout_x[7:0]),
+                              .we_C(we_y_from_top), .addr_C(addr_y_from_top), .data_C(din_y) );
+    
+    // Normalization module - performs right shift by 5 bits (divide by 32)
+    norm      U_norm      (   .clk(clk), .rst(rst), .en(norm_en), 
+                              .din(norm_din), .dout(norm_dout), .valid(norm_valid) );
+    
+    // ReLU activation module - sets negative values to zero
+    relu      U_relu      (   .clk(clk), .rst(rst), .en(relu_en),
+                              .din(relu_din), .dout(relu_dout), .valid(relu_valid) );
+
+    // Task to read computed matrix results from output memory
+    task read_result_matrix;
+        integer addr_counter;
+        begin
+            $display("=== Reading FC1 Result Matrix from Memory (%dx%d) ===", 8, current_batch_size);
+            
+            re_y_from_ext = 1'b1;
+            addr_counter = 0;
+            
+            // Read matrix data row by row from memory
+            for (i = 0; i < 8; i = i + 1) begin
+                for (j = 0; j < current_batch_size; j = j + 1) begin
+                    addr_y_from_ext = addr_counter;
+                    
+                    @(posedge clk);  // address setup time
+                    @(posedge clk);  // data available time
+                    
+                    X1[i][j] = dout_y;
+                    addr_counter = addr_counter + 1;
+                end
+            end
+            
+            re_y_from_ext = 1'b0;
+            addr_y_from_ext = 7'b0;
+            
+            // Display matrix contents in human-readable format
+            $display("=== FC1 Matrix (X1) Results ===");
+            for (i = 0; i < 8; i = i + 1) begin
+                $write("Row %0d: ", i);
+                for (j = 0; j < current_batch_size; j = j + 1) begin
+                    $write("%6d ", $signed(X1[i][j]));
+                end
+                $display("");
+            end
+            $display("=== Matrix Reading Complete ===");
+        end
+    endtask
+
+    // Task to apply normalization to each matrix element using dedicated module
+    task normalize_matrix;
+        integer i_temp, j_temp;
+        begin
+            $display("=== Starting Matrix Normalization (%dx%d) ===", 8, current_batch_size);
+            
+            // Process each element through normalization module
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    norm_din = X1[i_temp][j_temp];
+                    norm_en = 1'b1;
+                    
+                    @(posedge clk);
+                    
+                    // Wait for module to complete processing
+                    while (!norm_valid) begin
+                        @(posedge clk);
+                    end
+                    
+                    X2_normalized[i_temp][j_temp] = norm_dout;
+                    norm_en = 1'b0;
+                    @(posedge clk);
+                end
+            end
+            
+            // Display normalized results for verification
+            $display("=== Normalized Matrix (X2) Results ===");
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                $write("Row %0d: ", i_temp);
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    $write("%4d ", $signed(X2_normalized[i_temp][j_temp]));
+                end
+                $display("");
+            end
+            $display("=== Matrix Normalization Complete ===");
+        end
+    endtask
+
+    // Task to apply ReLU activation and store results back to input memory for FC2
+    task apply_relu_and_store;
+        integer i_temp, j_temp;
+        integer addr_counter;
+        begin
+            $display("=== Starting ReLU Processing and Storage (%dx%d) ===", 8, current_batch_size);
+            
+            addr_counter = 0;
+            
+            // Process each element through ReLU and store for next layer
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    relu_din = X2_normalized[i_temp][j_temp];
+                    relu_en = 1'b1;
+                    
+                    @(posedge clk);
+                    
+                    // Wait for ReLU module completion
+                    while (!relu_valid) begin
+                        @(posedge clk);
+                    end
+                    
+                    X3_relu[i_temp][j_temp] = relu_dout;
+                    relu_en = 1'b0;
+                    
+                    // Sign-extend 8-bit result to 16-bit and store in memory
+                    din_x = {{8{relu_dout[7]}}, relu_dout};
+                    addr_x_from_ext = addr_counter;
+                    we_x_from_ext = 1'b1;
+                    
+                    @(posedge clk);
+                    
+                    we_x_from_ext = 1'b0;
+                    addr_counter = addr_counter + 1;
+                    @(posedge clk);
+                end
+            end
+            
+            // Display ReLU processed matrix for debugging
+            $display("=== ReLU Matrix (X3) Results ===");
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                $write("Row %0d: ", i_temp);
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    $write("%4d ", $signed(X3_relu[i_temp][j_temp]));
+                end
+                $display("");
+            end
+            
+            // Clean up control signals
+            addr_x_from_ext = 7'b0;
+            din_x = 16'b0;
+            $display("=== ReLU Processing and Storage Complete ===");
+        end
+    endtask
+
+    // Task to execute FC2 matrix multiplication using second weight set
+    task run_fc2_computation;
+        begin
+            $display("=== Starting FC2 Matrix Multiplication ===");
+            $display("Time: %0t", $time);
+            
+            fc2_mode = 1'b1;  // switch to second weight matrix
+            
+            // Reset systolic array for second computation
+            $display("Applying reset for FC2...");
+            rst = 1'b1;
+            run = 1'b0;
+            repeat(5) @(posedge clk);
+            
+            rst = 1'b0;
+            $display("Reset released for FC2");
+            repeat(2) @(posedge clk);
+            
+            // Start matrix multiplication
+            $display("Starting FC2 matrix multiplication...");
+            run = 1'b1;
+            @(posedge clk);
+            run = 1'b0;
+            
+            wait_for_completion();
+            
+            $display("=== FC2 Matrix Multiplication Complete ===");
+        end
+    endtask
+
+    // Task to read final computation results from output memory
+    task read_fc2_results;
+        integer i_temp, j_temp;
+        integer addr_counter;
+        begin
+            $display("=== Reading FC2 Result Matrix from mem_Y (%dx%d) ===", 8, current_batch_size);
+            
+            re_y_from_ext = 1'b1;
+            addr_counter = 0;
+            
+            // Read final results from memory
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    addr_y_from_ext = addr_counter;
+                    
+                    @(posedge clk);
+                    @(posedge clk);
+                    
+                    Y_final[i_temp][j_temp] = dout_y;
+                    addr_counter = addr_counter + 1;
+                end
+            end
+            
+            re_y_from_ext = 1'b0;
+            addr_y_from_ext = 7'b0;
+            $display("=== FC2 Result Reading Complete ===");
+        end
+    endtask
+
+    // Task to load golden reference results for verification
+    task read_expected_results;
+        integer i_temp, j_temp;
+        integer addr_counter;
+        begin
+            $display("=== Reading Expected Result Matrix from mem_Y_final (%dx%d) ===", 8, current_batch_size);
+            
+            re_y_final_from_ext = 1'b1;
+            addr_counter = 0;
+            
+            // Load reference data from file
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    addr_y_final_from_ext = addr_counter;
+                    
+                    @(posedge clk);
+                    @(posedge clk);
+                    
+                    Y_expected[i_temp][j_temp] = dout_y_final;
+                    addr_counter = addr_counter + 1;
+                end
+            end
+            
+            re_y_final_from_ext = 1'b0;
+            addr_y_final_from_ext = 7'b0;
+            $display("=== Expected Result Reading Complete ===");
+        end
+    endtask
+
+    // Task to compare computed results against reference values
+    task compare_results;
+        integer i_temp, j_temp;
+        integer error_count;
+        reg test_passed;
+        integer total_elements;
+        begin
+            $display("=== Comparing FC2 Results with Expected Values ===");
+            
+            error_count = 0;
+            test_passed = 1'b1;
+            total_elements = 8 * current_batch_size;
+            
+            // Element-by-element comparison
+            for (i_temp = 0; i_temp < 8; i_temp = i_temp + 1) begin
+                for (j_temp = 0; j_temp < current_batch_size; j_temp = j_temp + 1) begin
+                    if (Y_final[i_temp][j_temp] !== Y_expected[i_temp][j_temp]) begin
+                        $display("ERROR: Mismatch at [%0d][%0d] - Got: %0d, Expected: %0d", 
+                                 i_temp, j_temp, $signed(Y_final[i_temp][j_temp]), $signed(Y_expected[i_temp][j_temp]));
+                        error_count = error_count + 1;
+                        test_passed = 1'b0;
+                    end else begin
+                        $display("PASS: [%0d][%0d] - Value: %0d", i_temp, j_temp, $signed(Y_final[i_temp][j_temp]));
+                    end
+                end
+            end
+            
+            // Generate test summary
+            $display("=== Comparison Complete ===");
+            $display("Total errors: %0d out of %0d elements", error_count, total_elements);
+            
+            if (test_passed) begin
+                $display("*** TEST PASSED - ALL RESULTS MATCH! ***");
+            end else begin
+                $display("*** TEST FAILED - %0d MISMATCHES FOUND ***", error_count);
+            end
+            
+            $display("=== Final Test Result: %s ===", test_passed ? "SUCCESS" : "FAILURE");
+        end
+    endtask
+
+    // Task to monitor computation progress and detect completion
+    task wait_for_completion;
+        integer timeout_counter;
+        begin
+            timeout_counter = 0;
+            
+            $display("Waiting for matrix multiplication to complete...");
+            
+            // Poll state machine until idle or timeout
+            while (state != 2'b00 && timeout_counter < 20000) begin
+                @(posedge clk);
+                timeout_counter = timeout_counter + 1;
+                
+                // Periodic status updates to monitor progress
+                if (timeout_counter % 1000 == 0) begin
+                    $display("Status: Still computing... (state=%b, cycles=%0d)", state, timeout_counter);
+                end
+            end
+            
+            if (timeout_counter >= 20000) begin
+                $display("ERROR: Computation timeout!");
+                $finish;
+            end else begin
+                $display("Matrix multiplication completed in %0d clock cycles", timeout_counter);
+            end
+        end
+    endtask
+
+    // Main comprehensive test sequence for complete TNN pipeline
+    task TNN_test;
+        input integer test_mode;  // 0: 8x8 base mode, 1: 8x16 extended mode
+        begin
+            $display("=== Starting Complete TNN Test (FC1 -> Norm -> ReLU -> FC2) ===");
+            $display("Mode: %s", test_mode ? "8x16" : "8x8");
+            $display("Time: %0t", $time);
+            
+            batch_mode = test_mode;
+            current_batch_size = test_mode ? 16 : 8;
+            
+            // Initialize all control signals to safe states
+            fc2_mode = 1'b0;
+            we_x_from_ext = 1'b0;
+            re_y_from_ext = 1'b0;
+            re_y_final_from_ext = 1'b0;
+            addr_x_from_ext = 7'b0;
+            addr_y_from_ext = 7'b0;
+            addr_y_final_from_ext = 7'b0;
+            norm_en = 1'b0;
+            norm_din = 16'b0;
+            relu_en = 1'b0;
+            relu_din = 8'b0;
+            din_x = 16'b0;
+            
+            // Load reference results for later verification
+            read_expected_results();
+            
+            $display("\n=== PHASE 1: FC1 COMPUTATION & TEST ===");
+            
+            // Reset system and prepare for first layer computation
+            rst = 1'b1;
+            run = 1'b0;
+            repeat(10) @(posedge clk);
+            
+            rst = 1'b0;
+            repeat(5) @(posedge clk);
+            
+            $display("Starting FC1 matrix multiplication...");
+            run = 1'b1;
+            @(posedge clk);
+            run = 1'b0;
+            
+            // Wait for FC1 completion and extract results
+            wait_for_completion();
+            read_result_matrix();
+            
+            $display("\n=== PHASE 2: NORMALIZATION ===");
+            normalize_matrix();
+            
+            $display("\n=== PHASE 3: RELU ACTIVATION ===");
+            apply_relu_and_store();
+            
+            $display("\n=== PHASE 4: FC2 COMPUTATION ===");
+            run_fc2_computation();
+            
+            $display("\n=== PHASE 5: RESULT VERIFICATION ===");
+            read_fc2_results();
+            compare_results();
+            
+            $display("\n=== COMPLETE TNN TEST SUMMARY ===");
+            $display("All phases completed successfully for %s mode", test_mode ? "8x16" : "8x8");
+            $display("Total simulation time: %0t", $time);
+        end          
+    endtask
+                     
+    // Main test sequence - executes both base and extended mode tests
+    initial begin
+        // Initialize all signals to known states
+        clk = 1'b0;
+        rst = 1'b1;
+        run = 1'b0;
+        batch_mode = 1'b0;
+        fc2_mode = 1'b0;
+        we_x_from_ext = 1'b0;
+        re_y_from_ext = 1'b0;
+        re_y_final_from_ext = 1'b0;
+        addr_x_from_ext = 7'b0;
+        addr_y_from_ext = 7'b0;
+        addr_y_final_from_ext = 7'b0;
+        norm_en = 1'b0;
+        norm_din = 16'b0;
+        relu_en = 1'b0;
+        relu_din = 8'b0;
+        din_x = 16'b0;
+        current_batch_size = 8;
+        
+        // Initialize matrix storage arrays to zero
+        $display("=== Initializing Matrix Buffers ===");
+        for (i = 0; i < 8; i = i + 1) begin
+            for (j = 0; j < 16; j = j + 1) begin
+                X1[i][j] = 16'h0000;
+                X2_normalized[i][j] = 8'h00;
+                X3_relu[i][j] = 8'h00;
+                Y_final[i][j] = 16'h0000;
+                Y_expected[i][j] = 16'h0000;
+            end
+        end
+        
+        repeat(10) @(posedge clk);
+        
+        $display("\n==========================================");
+        $display("STARTING FC1 ONLY DEBUG TEST - 8x8 BASE");
+        $display("==========================================");
+        
+        repeat(50) @(posedge clk);
+        
+        $display("\n==========================================");
+        $display("STARTING FULL TNN TEST - 8x8 BASE");
+        $display("==========================================");
+        TNN_test(0);  // Run base 8x8 test
+        
+        $display("\n==========================================");
+        $display("STARTING FC1 ONLY DEBUG TEST - 8x16 EXTRA");
+        $display("==========================================");
+        
+        repeat(50) @(posedge clk);
+        
+        $display("\n==========================================");
+        $display("STARTING FULL TNN TEST - 8x16 EXTRA");
+        $display("==========================================");
+        TNN_test(1);  // Run extended 8x16 test
+        
+        $display("\n=== ALL TESTS COMPLETED ===");
+        $display("Both 8x8 (base) and 8x16 (extra) modes tested successfully");
+        #100;
+        $finish();
+    end  
+    
+endmodule
