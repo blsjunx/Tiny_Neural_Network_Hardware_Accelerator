@@ -1,4 +1,4 @@
-# RTL Tiled Matrix Multiplication Neural Network Accelerator
+# Tiny Neural Network Accelerator Module and its Testbench 
 
 Verilog로 구현한 타일 기반 행렬곱 신경망 가속기
 
