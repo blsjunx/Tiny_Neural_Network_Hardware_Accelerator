@@ -1,7 +1,6 @@
 # RTL Tiled Matrix Multiplication Neural Network Accelerator
 
 Verilog로 구현한 타일 기반 행렬곱 신경망 가속기
-(Konkuk University, 2025)
 
 ---
 
